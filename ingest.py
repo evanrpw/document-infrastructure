@@ -50,11 +50,22 @@ parser.add_argument(
     default=1,
     help="folder depth for author (-1 to disable)",
 )
+parser.add_argument(
+    "--fips_depth",
+    type=int,
+    default=-1,
+    help="folder depth for fips code (-1 to disable)",
+)
 parser.add_argument("--separators", nargs="+", default=["\n\n", "\n", ". ", " "])
 parser.add_argument("--chunk_size", type=int, default=500)
 parser.add_argument("--overlap", type=int, default=100)
 parser.add_argument(
     "--no_page_numbers", action="store_true", help="disable page number tracking"
+)
+parser.add_argument(
+    "--no_chunking",
+    action="store_true",
+    help="disable chunking and embed the entire file as a single document",
 )
 parser.add_argument(
     "--embedding_model", default=os.getenv("AZURE_EMBEDDING_MODEL_NAME")
@@ -75,6 +86,11 @@ parser.add_argument(
     type=int,
     default=8,
     help="embedding batch size (set lower if embedding model rate limited)",
+)
+parser.add_argument(
+    "--dry_run",
+    action="store_true",
+    help="simulate processing and chunking without embedding or writing to the database",
 )
 parser.add_argument("-v", "--verbose", action="store_true")
 args = parser.parse_args()
@@ -139,6 +155,10 @@ def extract_pages(file_path):
 def chunk_text(text):
     """Yield (chunk_text, start_char, end_char) tuples with overlap."""
 
+    if args.no_chunking:
+        yield text.strip(), 0, len(text)
+        return
+
     def split(text, seps):
         if not text.strip():
             return []
@@ -188,10 +208,11 @@ def content_hash(chunk_text):
 
 
 def path_metadata(file_path):
-    """Return (rel_path_str, source_type, author) from folder structure."""
+    """Return (rel_path_str, source_type, author, fips) from folder structure."""
     try:
         rel = Path(file_path).relative_to(args.base_dir)
         parts = rel.parts[:-1]
+
         source_type = (
             parts[args.source_type_depth]
             if args.source_type_depth < len(parts)
@@ -202,9 +223,15 @@ def path_metadata(file_path):
             if args.author_depth != -1 and args.author_depth < len(parts)
             else "Unknown"
         )
-        return str(rel), source_type, author
+        # ADD FIPS EXTRACTION:
+        fips = (
+            parts[args.fips_depth]
+            if args.fips_depth != -1 and args.fips_depth < len(parts)
+            else None
+        )
+        return str(rel), source_type, author, fips
     except ValueError:
-        return str(file_path), "general", "Unknown"
+        return str(file_path), "general", "Unknown", None
 
 
 def chunk_pages(chunk_start, chunk_end, page_map):
@@ -235,7 +262,7 @@ def ingest_file(file_path):
         log.warning(f"  Skipping: no data extracted.")
         return False
 
-    rel_path, source_type, author = path_metadata(file_path)
+    rel_path, source_type, author, fips = path_metadata(file_path)
     if author == "Unknown":
         internal = pages[0].get("metadata", {}).get("author", "").strip()
         if internal:
@@ -254,8 +281,20 @@ def ingest_file(file_path):
         log.warning(f"  Skipping: no chunks produced.")
         return False
 
-    log.info(f"  {len(chunks)} chunks across {len(pages)} pages, embedding...")
+    log.info(f"  {len(chunks)} chunks across {len(pages)} pages.")
 
+    # ADD THIS DRY RUN BLOCK:
+    if args.dry_run:
+        log.info("  [DRY RUN] Skipping embedding and database upload.")
+        # Optionally print a preview of the first chunk's metadata for verification
+        if chunks:
+            preview_chunk = chunks[0][0][:100].replace("\n", " ")
+            log.info(
+                f"  [DRY RUN PREVIEW] source={source_type} | fips={fips} | text={preview_chunk}..."
+            )
+        return True
+
+    log.info("  Embedding...")
     try:
         embeddings = embed_chunks([c for c, *_ in chunks])
     except Exception as e:
@@ -274,6 +313,10 @@ def ingest_file(file_path):
             "sourceType": source_type,
             "chunkIndex": i,
         }
+
+        if fips is not None:
+            doc["fips"] = fips
+
         pages_hit = chunk_pages(c_start, c_end, page_map)
         if pages_hit is not None:
             doc["pageNumbers"] = pages_hit
