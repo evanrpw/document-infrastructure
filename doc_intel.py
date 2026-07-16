@@ -2,6 +2,8 @@ import argparse
 import json
 import logging
 import os
+import time
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,12 +21,37 @@ client = DocumentIntelligenceClient(
 )
 
 
+def analyze_with_retry(pdf_path: Path, max_attempts: int = 3):
+    """Call Azure Document Intelligence with simple exponential backoff.
+
+    Transient throttling/network errors are common at any real batch
+    scale, so a single failed call shouldn't sink an otherwise-good file.
+    """
+    delay = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with pdf_path.open("rb") as f:
+                poller = client.begin_analyze_document(
+                    model_id="prebuilt-layout",
+                    body=f,
+                    output_content_format="markdown",
+                )
+            return poller.result()
+        except Exception:
+            if attempt == max_attempts:
+                raise
+            log.warning(
+                f"  Attempt {attempt}/{max_attempts} failed for {pdf_path.name}, "
+                f"retrying in {delay}s..."
+            )
+            time.sleep(delay)
+            delay *= 2
+
+
 def save_result(pdf_path: Path, output_root: Path):
     relative = pdf_path.relative_to(args.input)
-    # The expected output path
     output_path = output_root / relative.parent / f"{pdf_path.stem}.docintel.json"
 
-    # Check if already processed
     if output_path.exists() and not args.force:
         log.info(f"Skipping {relative} (already processed)")
         return
@@ -32,23 +59,14 @@ def save_result(pdf_path: Path, output_root: Path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log.info(f"Processing {relative}")
 
-    with pdf_path.open("rb") as f:
-        poller = client.begin_analyze_document(
-            model_id="prebuilt-layout",
-            body=f,
-            output_content_format="markdown",
-        )
-
-    result = poller.result()
+    result = analyze_with_retry(pdf_path)
 
     md_path = output_root / relative.parent / f"{pdf_path.stem}.raw.md"
     result_dict = result.as_dict()
 
-    # Save JSON
     with output_path.open("w", encoding="utf-8") as fp:
         json.dump(result_dict, fp, indent=2, ensure_ascii=False)
 
-    # Save Markdown
     md_path.write_text(result.content or "", encoding="utf-8")
 
     log.info(f"Saved JSON {output_path}")
@@ -66,8 +84,14 @@ args = parser.parse_args()
 pdfs = sorted(args.input.rglob("*.pdf"))
 log.info(f"Found {len(pdfs)} PDFs")
 
+failures = []
 for pdf in pdfs:
     try:
         save_result(pdf, args.output)
-    except Exception as e:
+    except Exception:
         log.exception(f"Failed: {pdf}")
+        failures.append(str(pdf))
+
+if failures:
+    log.error(f"{len(failures)} file(s) failed extraction: {failures}")
+    sys.exit(1)
